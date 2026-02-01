@@ -3,86 +3,81 @@ const fs = require('fs');
 const app = express();
 app.use(express.json());
 
-// โหลดข้อมูล Keys และ History ของผู้เล่น
-let keys = JSON.parse(fs.readFileSync('./keys.json'));
-let playerHistory = {}; // ใช้เก็บว่า UserId นี้เคยใช้คีย์ไหนไปล่าสุดเมื่อไหร่
+const KEY_FILE = './keys.json';
+const TWO_DAYS_MS = 172800000;   // 2 วัน (เวลาใช้งาน)
+const FOUR_DAYS_MS = 345600000;  // 4 วัน (เวลาพักคนเดิมสำหรับคีย์นั้น)
 
-const USE_PERIOD = 2 * 24 * 60 * 60 * 1000;    // 2 วัน (เวลาใช้งาน)
-const BAN_PERIOD = 4 * 24 * 60 * 60 * 1000;    // 4 วัน (พักคนเดิม)
+// ฟังก์ชันโหลดและเซฟข้อมูล
+let keys = JSON.parse(fs.readFileSync(KEY_FILE, 'utf-8'));
+const saveKeys = () => fs.writeFileSync(KEY_FILE, JSON.stringify(keys, null, 2));
 
 app.post('/verify-key', (req, res) => {
-    const { key, hwid, userId } = req.body; // รับ userId มาด้วยเพื่อเช็คประวัติคน
+    const { key, hwid, userId } = req.body;
     const currentTime = Date.now();
 
-    // 1. เช็คคีย์ถาวร
-    let keyData = keys.find(k => k.key === key);
-    if (keyData && keyData.isPermanent) {
-        return res.json({ success: true, message: "VIP Owner" });
+    if (!userId || !hwid) {
+        return res.json({ success: false, message: "Missing User Data" });
     }
 
-    // 2. เช็คประวัติคนเดิม (พัก 4 วัน)
-    if (playerHistory[userId]) {
-        const timeSinceLastUsed = currentTime - playerHistory[userId].lastUsedTime;
-        if (timeSinceLastUsed < BAN_PERIOD) {
-            const daysLeft = Math.ceil((BAN_PERIOD - timeSinceLastUsed) / (1000 * 60 * 60 * 24));
-            return res.json({ 
-                success: false, 
-                message: `คุณต้องพักการใช้คีย์อีก ${daysLeft} วัน ถึงจะ Get คีย์ใหม่ได้` 
-            });
+    let keyData = keys.find(k => k.key === key);
+
+    // 1. ตรวจสอบว่ามีคีย์นี้ไหม
+    if (!keyData) {
+        return res.json({ success: false, message: "Invalid Key! Please get a new one." });
+    }
+
+    // 2. ถ้าเป็นคีย์ถาวร (VIP) ให้ผ่านตลอด
+    if (keyData.isPermanent) {
+        return res.json({ success: true, message: "Welcome VIP Owner" });
+    }
+
+    // 3. เช็คประวัติคนเดิม (พัก 4 วันสำหรับคีย์รหัสเดิม)
+    if (keyData.lastUser === userId) {
+        const timeSinceExpired = currentTime - keyData.expiryTime;
+        if (timeSinceExpired < FOUR_DAYS_MS) {
+            // หลอกว่าคีย์ผิด เพื่อให้เขาไป Get คีย์รหัสอื่นมาใส่
+            return res.json({ success: false, message: "Invalid Key! (Please get a NEW key from link)" });
         }
     }
 
-    if (!keyData) return res.json({ success: false, message: "Invalid Key" });
-
-    // 3. เช็คสถานะคีย์
-    if (!keyData.startTime || !keyData.hwid) {
-        // คีย์ว่าง -> ให้คนนี้ครอง
+    // 4. ถ้าคีย์ว่าง (ไม่มีคนใช้ หรือโดน Reset ไปแล้ว)
+    if (!keyData.startTime) {
         keyData.startTime = currentTime;
         keyData.hwid = hwid;
-        keyData.currentUserId = userId;
-        saveData();
-        return res.json({ success: true, message: "Activated" });
+        keyData.currentUser = userId;
+        saveKeys();
+        return res.json({ success: true, message: "Key Activated!" });
     }
 
+    // 5. ถ้าคีย์กำลังถูกใช้งานอยู่
     const elapsedTime = currentTime - keyData.startTime;
 
-    if (elapsedTime < USE_PERIOD) {
-        // ยังไม่ครบ 2 วัน
+    if (elapsedTime < TWO_DAYS_MS) {
+        // ยังอยู่ในช่วง 2 วันที่ใช้ได้
         if (keyData.hwid === hwid) {
-            return res.json({ success: true, message: "Auto-login" });
+            // เจ้าของเดิม -> รันออโต้
+            return res.json({ success: true, message: "Auto-login success" });
         } else {
-            return res.json({ success: false, message: "คีย์นี้มีคนใช้อยู่" });
+            // คนอื่นแอบเอาไปใช้
+            return res.json({ success: false, message: "This key is already in use by another device." });
         }
     } else {
-        // [ครบ 2 วันแล้ว] 
-        // บันทึกประวัติคนเก่าว่าต้องพัก 4 วัน
-        playerHistory[keyData.currentUserId] = { lastUsedTime: currentTime };
-        
-        // เช็คว่าคนเดิมพยายามจะใช้ต่อไหม
-        if (keyData.currentUserId === userId) {
-            // ล้างค่าคีย์เพื่อให้คนอื่นใช้ แต่ตัวเองติดพัก 4 วันไปแล้วข้างบน
-            resetKey(keyData);
-            return res.json({ success: false, message: "ครบ 2 วันแล้ว คุณต้องพัก 4 วัน" });
-        }
+        // [หมดอายุ 2 วันพอดี]
+        // บันทึกประวัติคนล่าสุดลงในช่อง lastUser เพื่อเริ่มนับเวลาพัก 4 วัน
+        keyData.lastUser = keyData.currentUser;
+        keyData.expiryTime = currentTime;
 
-        // ถ้าเป็นคนใหม่มา Get -> ให้เริ่มนับ 1 ใหม่ทันที
-        keyData.startTime = currentTime;
-        keyData.hwid = hwid;
-        keyData.currentUserId = userId;
-        saveData();
-        return res.json({ success: true, message: "Key Transferred to new user" });
+        // Reset ข้อมูลปัจจุบันให้เป็นค่าว่าง (เพื่อให้คนใหม่มาใช้ได้)
+        keyData.startTime = null;
+        keyData.hwid = null;
+        keyData.currentUser = null;
+
+        saveKeys();
+        return res.json({ success: false, message: "Key Expired! Get a new one." });
     }
 });
 
-function resetKey(k) {
-    k.startTime = null;
-    k.hwid = null;
-    k.currentUserId = null;
-    saveData();
-}
-
-function saveData() {
-    fs.writeFileSync('./keys.json', JSON.stringify(keys, null, 2));
-}
-
-app.listen(3000, () => console.log('Server running on port 3000'));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`Miner Hub API running on port ${PORT}`);
+});
