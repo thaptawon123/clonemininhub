@@ -1,78 +1,88 @@
 const express = require('express');
-const { MongoClient } = require('mongodb');
-const axios = require('axios');
+const fs = require('fs');
 const app = express();
-const port = process.env.PORT || 3000;
+app.use(express.json());
 
-const uri = process.env.MONGO_URI;
-const client = new MongoClient(uri);
+// โหลดข้อมูล Keys และ History ของผู้เล่น
+let keys = JSON.parse(fs.readFileSync('./keys.json'));
+let playerHistory = {}; // ใช้เก็บว่า UserId นี้เคยใช้คีย์ไหนไปล่าสุดเมื่อไหร่
 
-const GITHUB_SCRIPT_URL = 'https://raw.githubusercontent.com/thaptawon123/clonemininhub/main/script.lua';
+const USE_PERIOD = 2 * 24 * 60 * 60 * 1000;    // 2 วัน (เวลาใช้งาน)
+const BAN_PERIOD = 4 * 24 * 60 * 60 * 1000;    // 4 วัน (พักคนเดิม)
 
-app.get('/verify', async (req, res) => {
-    const { key, hwid } = req.query;
+app.post('/verify-key', (req, res) => {
+    const { key, hwid, userId } = req.body; // รับ userId มาด้วยเพื่อเช็คประวัติคน
+    const currentTime = Date.now();
 
-    if (!key || !hwid) {
-        return res.json({ success: false, message: "กรุณาระบุ Key และ HWID" });
+    // 1. เช็คคีย์ถาวร
+    let keyData = keys.find(k => k.key === key);
+    if (keyData && keyData.isPermanent) {
+        return res.json({ success: true, message: "VIP Owner" });
     }
 
-    try {
-        await client.connect();
-        const db = client.db('roblox-api');
-        const keysCollection = db.collection('keys');
-
-        const keyData = await keysCollection.findOne({ key: key });
-
-        if (!keyData) {
-            return res.json({ success: false, message: "ไม่พบคีย์นี้ในระบบ" });
+    // 2. เช็คประวัติคนเดิม (พัก 4 วัน)
+    if (playerHistory[userId]) {
+        const timeSinceLastUsed = currentTime - playerHistory[userId].lastUsedTime;
+        if (timeSinceLastUsed < BAN_PERIOD) {
+            const daysLeft = Math.ceil((BAN_PERIOD - timeSinceLastUsed) / (1000 * 60 * 60 * 24));
+            return res.json({ 
+                success: false, 
+                message: `คุณต้องพักการใช้คีย์อีก ${daysLeft} วัน ถึงจะ Get คีย์ใหม่ได้` 
+            });
         }
+    }
 
-        const now = new Date();
+    if (!keyData) return res.json({ success: false, message: "Invalid Key" });
 
-        if (keyData.activatedAt) {
-            // เช็ค HWID (ใช้ได้ทั้งคีย์ปกติและคีย์ถาวร)
-            if (keyData.hwid !== hwid) {
-                return res.json({ success: false, message: "คีย์นี้ถูกใช้กับเครื่องอื่นไปแล้ว" });
-            }
+    // 3. เช็คสถานะคีย์
+    if (!keyData.startTime || !keyData.hwid) {
+        // คีย์ว่าง -> ให้คนนี้ครอง
+        keyData.startTime = currentTime;
+        keyData.hwid = hwid;
+        keyData.currentUserId = userId;
+        saveData();
+        return res.json({ success: true, message: "Activated" });
+    }
 
-            // --- ส่วนที่แก้ไข: เช็คเวลาเฉพาะคีย์ที่ไม่ใช่ถาวร ---
-            if (!keyData.isPermanent) {
-                const activatedDate = new Date(keyData.activatedAt);
-                const expiryDate = new Date(activatedDate.getTime() + (24 * 60 * 60 * 1000));
+    const elapsedTime = currentTime - keyData.startTime;
 
-                if (now > expiryDate) {
-                    return res.json({ success: false, message: "คีย์นี้หมดอายุแล้ว (Expired)" });
-                }
-            }
-            // -------------------------------------------
-            
+    if (elapsedTime < USE_PERIOD) {
+        // ยังไม่ครบ 2 วัน
+        if (keyData.hwid === hwid) {
+            return res.json({ success: true, message: "Auto-login" });
         } else {
-            // ลงทะเบียนครั้งแรก
-            await keysCollection.updateOne(
-                { key: key },
-                { 
-                    $set: { 
-                        hwid: hwid, 
-                        activatedAt: now.toISOString() 
-                    } 
-                }
-            );
+            return res.json({ success: false, message: "คีย์นี้มีคนใช้อยู่" });
+        }
+    } else {
+        // [ครบ 2 วันแล้ว] 
+        // บันทึกประวัติคนเก่าว่าต้องพัก 4 วัน
+        playerHistory[keyData.currentUserId] = { lastUsedTime: currentTime };
+        
+        // เช็คว่าคนเดิมพยายามจะใช้ต่อไหม
+        if (keyData.currentUserId === userId) {
+            // ล้างค่าคีย์เพื่อให้คนอื่นใช้ แต่ตัวเองติดพัก 4 วันไปแล้วข้างบน
+            resetKey(keyData);
+            return res.json({ success: false, message: "ครบ 2 วันแล้ว คุณต้องพัก 4 วัน" });
         }
 
-        const response = await axios.get(GITHUB_SCRIPT_URL);
-        res.json({
-            success: true,
-            message: keyData.isPermanent ? "ยินดีด้วย! คุณใช้คีย์ถาวร" : "ยืนยันคีย์สำเร็จ (24 ชม.)",
-            content: response.data
-        });
-
-    } catch (error) {
-        res.status(500).json({ success: false, message: "Server Error: " + error.message });
-    } finally {
-        await client.close();
+        // ถ้าเป็นคนใหม่มา Get -> ให้เริ่มนับ 1 ใหม่ทันที
+        keyData.startTime = currentTime;
+        keyData.hwid = hwid;
+        keyData.currentUserId = userId;
+        saveData();
+        return res.json({ success: true, message: "Key Transferred to new user" });
     }
 });
 
-app.listen(port, () => {
-    console.log(`Server running at http://localhost:${port}`);
-});
+function resetKey(k) {
+    k.startTime = null;
+    k.hwid = null;
+    k.currentUserId = null;
+    saveData();
+}
+
+function saveData() {
+    fs.writeFileSync('./keys.json', JSON.stringify(keys, null, 2));
+}
+
+app.listen(3000, () => console.log('Server running on port 3000'));
