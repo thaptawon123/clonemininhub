@@ -6,7 +6,7 @@ app.use(express.json());
 
 // --- 1. ตั้งค่าเชื่อมต่อ MongoDB ---
 // นำ Connection String จาก MongoDB Atlas มาวางตรงนี้
-const MONGO_URI = "mongodb+srv://iog011horizon_db_user:2BSfsui2E92SlM3p@cluster0.s6uoqof.mongodb.net/?appName=Cluster0";
+const MONGO_URI = "mongodb+srv://iog011horizon_db_user:2BSfsui2E92SlM3p@cluster0.s6uoqof.mongodb.net/roblox-api?retryWrites=true&w=majority&appName=Cluster0";
 
 mongoose.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
     .then(() => console.log("Connected to MongoDB Atlas"))
