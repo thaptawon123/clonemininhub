@@ -1,0 +1,14 @@
+{
+  "name": "roblox-api",
+  "version": "1.0.0",
+  "main": "server.js",
+  "dependencies": {
+    "express": "^4.18.2",
+    "mongoose": "^7.0.0",
+    "axios": "^1.3.0",
+    "dotenv": "^16.0.0"
+  },
+  "scripts": {
+    "start": "node server.js"
+  }
+}
