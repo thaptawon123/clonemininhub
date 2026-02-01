@@ -4,93 +4,64 @@ const app = express();
 
 app.use(express.json());
 
-// --- 1. ตั้งค่าเชื่อมต่อ MongoDB ---
-// นำ Connection String จาก MongoDB Atlas มาวางตรงนี้
-const MONGO_URI = "mongodb+srv://iog011horizon_db_user:2BSfsui2E92SlM3p@cluster0.s6uoqof.mongodb.net/roblox-api?retryWrites=true&w=majority&appName=Cluster0";
+// เชื่อมต่อ MongoDB ผ่านตัวแปร MONGO_URI ใน Vercel
+mongoose.connect(process.env.MONGO_URI)
+    .then(() => console.log("Connected to MongoDB"))
+    .catch(err => console.error("Could not connect to MongoDB", err));
 
-mongoose.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
-    .then(() => console.log("Connected to MongoDB Atlas"))
-    .catch(err => console.error("Error connecting to MongoDB:", err));
-
-// --- 2. สร้างโครงสร้างข้อมูล (Schema) ---
-const keySchema = new mongoose.Schema({
-    key: { type: String, required: true, unique: true },
-    isPermanent: { type: Boolean, default: false },
-    startTime: { type: Number, default: null },
-    hwid: { type: String, default: null },
-    currentUser: { type: String, default: null },
-    lastUser: { type: String, default: null },
-    expiryTime: { type: Number, default: null }
+// โครงสร้าง Database ให้ตรงกับภาพที่คุณส่งมา
+const KeySchema = new mongoose.Schema({
+    key: String,
+    isPermanent: Boolean,
+    startTime: Date,
+    hwid: String,
+    expiryTime: Date
 });
 
-const Key = mongoose.model('Keys', keySchema);
+const KeyModel = mongoose.model('keys', KeySchema);
 
-const TWO_DAYS_MS = 172800000;   // 2 วัน
-const FOUR_DAYS_MS = 345600000;  // 4 วัน
-
-// --- 3. ตรรกะการตรวจสอบ (Verify Logic) ---
-app.post('/verify-key', async (req, res) => {
-    const { key, hwid, userId } = req.body;
-    const currentTime = Date.now();
-
-    if (!userId || !hwid) {
-        return res.json({ success: false, message: "Missing User Data" });
-    }
+// API สำหรับตรวจสอบ Key
+app.get('/check-key/:userKey', async (req, res) => {
+    const userKey = req.params.userKey;
+    const userHwid = req.headers['hwid']; // รับค่าจาก Roblox
 
     try {
-        let keyData = await Key.findOne({ key: key });
+        const foundKey = await KeyModel.findOne({ key: userKey });
 
-        // ตรวจสอบว่ามีคีย์ไหม
-        if (!keyData) {
-            return res.json({ success: false, message: "Invalid Key! Please get a new one." });
+        if (!foundKey) {
+            return res.json({ success: false, message: "ไม่พบ Key นี้ในระบบ" });
         }
 
-        // ตรรกะเดิม: ถ้าเป็น VIP (Permanent) ให้ผ่านตลอด
-        if (keyData.isPermanent) {
-            return res.json({ success: true, message: "Welcome VIP Owner" });
+        const now = new Date();
+
+        // 1. ตรวจสอบวันหมดอายุ
+        if (foundKey.expiryTime && now > new Date(foundKey.expiryTime)) {
+            return res.json({ success: false, message: "Key นี้หมดอายุแล้ว" });
         }
 
-        // ตรรกะเดิม: เช็คประวัติคนล่าสุด (พัก 4 วันสำหรับคนเดิม)
-        if (keyData.lastUser === userId) {
-            const timeSinceExpired = currentTime - (keyData.expiryTime || 0);
-            if (timeSinceExpired < FOUR_DAYS_MS) {
-                return res.json({ success: false, message: "Invalid Key! (Wait 4 days for this key)" });
-            }
+        // 2. ตรวจสอบการ Lock HWID
+        if (foundKey.hwid && foundKey.hwid !== "" && foundKey.hwid !== userHwid) {
+            return res.json({ success: false, message: "Key นี้ถูกใช้โดยคนอื่นไปแล้ว" });
         }
 
-        // ตรรกะเดิม: ถ้าคีย์ว่าง (เริ่มใช้งานครั้งแรก)
-        if (!keyData.startTime) {
-            keyData.startTime = currentTime;
-            keyData.hwid = hwid;
-            keyData.currentUser = userId;
-            await keyData.save();
-            return res.json({ success: true, message: "Key Activated!" });
+        // 3. ถ้าเป็นคนแรกที่ใช้ ให้บันทึกข้อมูลและตั้งเวลา 2 วัน
+        if (!foundKey.hwid || foundKey.hwid === "") {
+            const newExpiry = new Date();
+            newExpiry.setDate(newExpiry.getDate() + 2); // บวกเพิ่ม 2 วัน
+
+            foundKey.hwid = userHwid;
+            foundKey.startTime = now;
+            foundKey.expiryTime = newExpiry;
+            await foundKey.save();
+            
+            return res.json({ success: true, message: "ยินดีด้วย! ใช้ได้อีก 2 วัน" });
         }
 
-        // ตรรกะเดิม: เช็คช่วงเวลา 2 วัน
-        const elapsedTime = currentTime - keyData.startTime;
+        res.json({ success: true, message: "Key ถูกต้อง (เจ้าของเดิม)" });
 
-        if (elapsedTime < TWO_DAYS_MS) {
-            // เช็คว่าคนเดิมไหม
-            if (keyData.hwid === hwid) {
-                return res.json({ success: true, message: "Auto-login success" });
-            } else {
-                return res.json({ success: false, message: "This key is already in use by another device." });
-            }
-        } else {
-            // ตรรกะเดิม: หมดอายุ 2 วัน -> รีเซ็ตและเริ่มพัก 4 วัน
-            keyData.lastUser = keyData.currentUser;
-            keyData.expiryTime = currentTime;
-            keyData.startTime = null;
-            keyData.hwid = null;
-            keyData.currentUser = null;
-            await keyData.save();
-            return res.json({ success: false, message: "Key Expired! Get a new one." });
-        }
     } catch (err) {
-        res.status(500).json({ success: false, message: "Database Error" });
+        res.status(500).json({ success: false, message: "Server Error" });
     }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+module.exports = app;
