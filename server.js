@@ -23,7 +23,7 @@ const keySchema = new mongoose.Schema({
     expiryTime: { type: Number, default: null }
 });
 
-const Key = mongoose.model('Key', keySchema);
+const Key = mongoose.model('Keys', keySchema);
 
 const TWO_DAYS_MS = 172800000;   // 2 วัน
 const FOUR_DAYS_MS = 345600000;  // 4 วัน
