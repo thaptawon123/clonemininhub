@@ -1,51 +1,78 @@
 const express = require('express');
-const mongoose = require('mongoose');
+const { MongoClient } = require('mongodb');
 const axios = require('axios');
-require('dotenv').config();
-
 const app = express();
+const port = process.env.PORT || 3000;
 
-// เชื่อมต่อ MongoDB (ค่านี้จะไปตั้งในหน้า Dashboard ของ Render)
-mongoose.connect(process.env.MONGO_URI)
-    .then(() => console.log("DB Connected"))
-    .catch(err => console.log("DB Error:", err));
+const uri = process.env.MONGO_URI;
+const client = new MongoClient(uri);
 
-// โครงสร้าง Database สำหรับเก็บ Key
-const Key = mongoose.model('Key', new mongoose.Schema({
-    key: String,
-    hwid: String,
-    expiresAt: Date
-}));
+// URL ของสคริปต์จริงใน GitHub (Raw)
+const GITHUB_SCRIPT_URL = 'https://raw.githubusercontent.com/thaptawon123/clonemininhub/main/script.lua';
 
 app.get('/verify', async (req, res) => {
     const { key, hwid } = req.query;
 
+    if (!key || !hwid) {
+        return res.json({ success: false, message: "กรุณาระบุ Key และ HWID" });
+    }
+
     try {
-        const foundKey = await Key.findOne({ key: key });
+        await client.connect();
+        const db = client.db('roblox-api');
+        const keysCollection = db.collection('keys');
 
-        if (!foundKey) return res.json({ success: false, message: "ไม่พบ Key นี้ในระบบ" });
-        if (new Date() > foundKey.expiresAt) return res.json({ success: false, message: "Key หมดอายุแล้ว" });
+        // 1. ค้นหาคีย์ในฐานข้อมูล
+        const keyData = await keysCollection.findOne({ key: key });
 
-        // ระบบ Lock HWID
-        if (!foundKey.hwid) {
-            foundKey.hwid = hwid;
-            await foundKey.save();
-        } else if (foundKey.hwid !== hwid) {
-            return res.json({ success: false, message: "Key นี้ถูกใช้กับเครื่องอื่นไปแล้ว" });
+        if (!keyData) {
+            return res.json({ success: false, message: "ไม่พบคีย์นี้ในระบบ" });
         }
 
-        // ดึงสคริปต์จริงจาก GitHub ของคุณมาส่งต่อ
-        const githubRes = await axios.get(process.env.GITHUB_SCRIPT_URL);
-        
+        const now = new Date();
+
+        // 2. ตรวจสอบการเปิดใช้งาน (Activation)
+        if (keyData.activatedAt) {
+            // คีย์นี้ถูกใช้ไปแล้ว -> เช็ค HWID
+            if (keyData.hwid !== hwid) {
+                return res.json({ success: false, message: "คีย์นี้ถูกใช้กับเครื่องอื่นไปแล้ว" });
+            }
+
+            // เช็คเวลาหมดอายุ (24 ชั่วโมง)
+            const activatedDate = new Date(keyData.activatedAt);
+            const expiryDate = new Date(activatedDate.getTime() + (24 * 60 * 60 * 1000));
+
+            if (now > expiryDate) {
+                return res.json({ success: false, message: "คีย์นี้หมดอายุแล้ว (Expired)" });
+            }
+        } else {
+            // คีย์ยังว่าง -> เริ่มการผูก HWID และบันทึกเวลาที่เริ่มใช้
+            await keysCollection.updateOne(
+                { key: key },
+                { 
+                    $set: { 
+                        hwid: hwid, 
+                        activatedAt: now.toISOString() 
+                    } 
+                }
+            );
+        }
+
+        // 3. ถ้าผ่านทุกเงื่อนไข ดึงสคริปต์จาก GitHub ส่งกลับไป
+        const response = await axios.get(GITHUB_SCRIPT_URL);
         res.json({
             success: true,
-            content: githubRes.data // โค้ด clonemining.lua ของคุณ
+            message: "ยืนยันคีย์สำเร็จ",
+            content: response.data
         });
 
     } catch (error) {
-        res.status(500).json({ success: false, message: "Server Error" });
+        res.status(500).json({ success: false, message: "Server Error: " + error.message });
+    } finally {
+        await client.close();
     }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`API running on port ${PORT}`));
+app.listen(port, () => {
+    console.log(`Server running at http://localhost:${port}`);
+});
